@@ -6,7 +6,7 @@ This example, based on [ESP_Brookesia](https://github.com/espressif/esp-brookesi
 
 ## Getting Started
 
-
+#ggg
 ### Prerequisites
 
 * An ESP32-P4-Function-EV-Board.
