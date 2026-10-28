@@ -1,0 +1,15 @@
+**/squareline/backup/**
+**/squareline/autosave/**
+components/lvgl/**
+
+Fragmento de código
+build/
+dependencies.lock
+sdkconfig.old
+sdkconfig
+managed_components/
+.vscode/
+.claude/
+*.bin
+*.elf
+*.map

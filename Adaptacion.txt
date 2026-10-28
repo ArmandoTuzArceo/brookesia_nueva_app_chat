@@ -1,0 +1,23 @@
+Cambios requeridos:
+1. Copia la carpeta del proyecto entero contenido en el zip en una nueva carpeta.
+1. Copia las bibliotecas espressif__esp-brookesia que proporciona el fabricante en una carpeta llamada common_components 
+a la carpeta components del proyecto.
+2. Modifica el archivo idf_component.yml de la biblioteca espressif__esp32_p4_function_ev_board específicamente en:
+
+	  espressif/esp_lvgl_port:
+    public: true
+    version: ^2
+	
+	... por:
+	
+	  espressif/esp_lvgl_port:
+    public: true
+    version: "~2.8.0"
+4. Abre el proyecto en Visual Studio Code con el plugin de espressif y la versión del compilador en 5.5.6.
+5. Ajusta el chip IDF_TARGET a esp32p4 y luego elija la opción esp32p4 chip (via built USB JTAG)
+6. Configura el menuconfig lo siguiente:
+	a) Flash SPI mode QIO, STR mode, 80Mhz, 16 MB
+	b) Ve a "Example Configurations" y habilita "Enable SD Card"
+	c) Ve a "component config" habilita "OV02C10" y seleccione "MIPI 1-lane, 24M input, 1288x728 30fps, RAW10"
+	e) chip revision: Activar el casillero "Select ESP32-P4 revisions <3.0 (No >=3.x Support)"
+7. Guarde, limpie, compile y cargue el firmware al módulo.
