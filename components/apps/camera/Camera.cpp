@@ -5,6 +5,7 @@
  */
 
 #include <string.h>
+#include <stdio.h>
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_check.h"
@@ -28,6 +29,7 @@
 #include "app_pedestrian_detect.h"
 #include "app_humanface_detect.h"
 #include "app_camera_pipeline.hpp"
+#include "PhotoStorage.hpp"
 #include "Camera.hpp"
 #include "ui/ui.h"
 
@@ -65,6 +67,7 @@ static lv_obj_t *btn_label = NULL;
 static size_t data_cache_line_size = 0;
 static ppa_client_handle_t ppa_client_srm_handle = NULL;
 static EventGroupHandle_t camera_event_group;
+static Camera *camera_app;
 
 static void camera_video_frame_operation(uint8_t *camera_buf, uint8_t camera_buf_index, 
                                        uint32_t camera_buf_hes, uint32_t camera_buf_ves, 
@@ -77,12 +80,13 @@ Camera::Camera(uint16_t hor_res, uint16_t ver_res):
     _screen_index(SCREEN_CAMERA_SHOT),
     _hor_res(hor_res),
     _ver_res(ver_res),
-    _img_album_dsc_size(hor_res > ver_res ? ver_res : hor_res),
     _img_album_buffer(NULL),
+    _photo_status_label(NULL),
+    _photo_status_timer(NULL),
     _camera_init_sem(NULL),
     _camera_ctlr_handle(0)
 {
-    _img_album_buf_bytes = _img_album_dsc_size * _img_album_dsc_size * sizeof(lv_color_t);
+    _img_album_buf_bytes = static_cast<size_t>(hor_res) * ver_res * sizeof(lv_color_t);
 }
 
 Camera::~Camera()
@@ -91,6 +95,12 @@ Camera::~Camera()
 
 bool Camera::run(void)
 {
+    esp_err_t storage_result = PhotoStorage::start();
+    if (storage_result != ESP_OK) {
+        ESP_LOGE(TAG, "Photo storage task start failed: %s", esp_err_to_name(storage_result));
+        return false;
+    }
+
     if (_camera_init_sem == NULL) {
         _camera_init_sem = xSemaphoreCreateBinary();
         assert(_camera_init_sem != NULL);
@@ -158,6 +168,17 @@ bool Camera::run(void)
     lv_obj_add_event_cb(ui_ButtonCameraShotBtn, onScreenCameraShotBtnClick, LV_EVENT_CLICKED, this);
 
     lv_obj_add_flag(ui_PanelCameraShotTitle, LV_OBJ_FLAG_HIDDEN);
+    _photo_status_label = lv_label_create(ui_ScreenCameraShot);
+    lv_obj_set_style_text_color(_photo_status_label, lv_color_white(), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(_photo_status_label, lv_color_black(), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(_photo_status_label, LV_OPA_70, LV_PART_MAIN);
+    lv_obj_align(_photo_status_label, LV_ALIGN_TOP_MID, 0, 8);
+    _photo_status_timer = lv_timer_create(photoStatusTimerCb, 200, this);
+    if (_photo_status_timer == NULL) {
+        ESP_LOGE(TAG, "Create photo status timer failed");
+        return false;
+    }
+    photoStatusTimerCb(_photo_status_timer);
 
     lv_obj_t *mode_switch_btn = lv_btn_create(ui_ImageCameraShotImage);
     lv_obj_set_style_bg_color(mode_switch_btn, lv_color_hex(0x808080), LV_PART_MAIN);
@@ -226,12 +247,21 @@ bool Camera::back(void)
 bool Camera::close(void)
 {
     xEventGroupSetBits(camera_event_group, CAMERA_EVENT_TASK_RUN);
-    xEventGroupSetBits(camera_event_group, CAMERA_EVENT_DELETE);
     xEventGroupClearBits(camera_event_group, CAMERA_EVENT_PED_DETECT);
     xEventGroupClearBits(camera_event_group, CAMERA_EVENT_HUMAN_DETECT);
     
     app_video_stream_task_stop(_camera_ctlr_handle);
     app_video_stream_wait_stop();
+    xEventGroupSetBits(camera_event_group, CAMERA_EVENT_DELETE);
+
+    if (_photo_status_timer != NULL) {
+        lv_timer_del(_photo_status_timer);
+        _photo_status_timer = NULL;
+    }
+    if (_photo_status_label != NULL) {
+        lv_obj_del(_photo_status_label);
+        _photo_status_label = NULL;
+    }
 
     if (_img_album_buffer) {
         heap_caps_free(_img_album_buffer);
@@ -243,6 +273,7 @@ bool Camera::close(void)
 
 bool Camera::init(void)
 {
+    camera_app = this;
     camera_event_group = xEventGroupCreate();
     xEventGroupClearBits(camera_event_group, CAMERA_EVENT_TASK_RUN);
     xEventGroupClearBits(camera_event_group, CAMERA_EVENT_DELETE);
@@ -329,6 +360,20 @@ int Camera::get_camera_ctlr_handle(void)
     return _camera_ctlr_handle;
 }
 
+void Camera::updateAlbumFromFrame(const uint8_t *frame, size_t frame_size)
+{
+    if (_img_album_buffer == NULL || _img_album == NULL || frame == NULL ||
+        frame_size > _img_album_buf_bytes) {
+        return;
+    }
+
+    memcpy(_img_album_buffer, frame, frame_size);
+    _img_album_dsc.data_size = frame_size;
+    lv_img_set_src(_img_album, &_img_album_dsc);
+    lv_obj_add_flag(_img_album, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(ui_PanelCameraShotAlbum, LV_OBJ_FLAG_CLICKABLE);
+}
+
 void Camera::taskCameraInit(Camera *app)
 {
     ESP_ERROR_CHECK(app_video_set_bufs(app->_camera_ctlr_handle, EXAMPLE_CAM_BUF_NUM, (const void **)app->_cam_buffer));
@@ -354,14 +399,51 @@ void Camera::onScreenCameraShotBtnClick(lv_event_t *e)
         return;
     }
 
-    lv_obj_add_flag(camera->_img_album, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(ui_PanelCameraShotAlbum, LV_OBJ_FLAG_CLICKABLE);
-    lv_img_set_src(camera->_img_album, &camera->_img_album_dsc);
+    if (PhotoStorage::requestCapture()) {
+        lv_obj_clear_flag(ui_ButtonCameraShotBtn, LV_OBJ_FLAG_CLICKABLE);
+        if (camera->_photo_status_label != NULL) {
+            lv_label_set_text(camera->_photo_status_label, "Capturando foto...");
+        }
+    }
+}
 
-    xEventGroupClearBits(camera_event_group, CAMERA_EVENT_TASK_RUN);
-    memcpy(camera->_img_album_buffer, camera->_img_refresh_dsc.data,
-           camera->_img_refresh_dsc.data_size);
-    xEventGroupSetBits(camera_event_group, CAMERA_EVENT_TASK_RUN);
+void Camera::photoStatusTimerCb(lv_timer_t *timer)
+{
+    Camera *camera = static_cast<Camera *>(timer->user_data);
+    if (camera == NULL || camera->_photo_status_label == NULL) {
+        return;
+    }
+
+    PhotoStorage::State state = PhotoStorage::state();
+    if (state == PhotoStorage::State::Preparing ||
+        state == PhotoStorage::State::WaitingForFrame ||
+        state == PhotoStorage::State::Capturing ||
+        state == PhotoStorage::State::Saving) {
+        lv_obj_clear_flag(ui_ButtonCameraShotBtn, LV_OBJ_FLAG_CLICKABLE);
+        lv_label_set_text(camera->_photo_status_label, "Guardando foto...");
+        return;
+    }
+
+    lv_obj_add_flag(ui_ButtonCameraShotBtn, LV_OBJ_FLAG_CLICKABLE);
+    if (state == PhotoStorage::State::Saved) {
+        char status[64];
+        snprintf(status, sizeof(status), "Guardada: %s", PhotoStorage::lastFilename());
+        lv_label_set_text(camera->_photo_status_label, status);
+    } else if (state == PhotoStorage::State::Failed) {
+        int system_error = PhotoStorage::lastSystemError();
+        if (system_error != 0) {
+            char status[96];
+            snprintf(status, sizeof(status), "Error SD: %s", strerror(system_error));
+            lv_label_set_text(camera->_photo_status_label, status);
+        } else {
+            char status[96];
+            snprintf(status, sizeof(status), "Error al guardar: %s",
+                     esp_err_to_name(PhotoStorage::lastError()));
+            lv_label_set_text(camera->_photo_status_label, status);
+        }
+    } else {
+        lv_label_set_text(camera->_photo_status_label, "");
+    }
 }
 
 static bool ppa_trans_done_cb(ppa_client_handle_t ppa_client, ppa_event_data_t *event_data, void *user_data)
@@ -454,6 +536,7 @@ static void camera_video_frame_operation(uint8_t *camera_buf, uint8_t camera_buf
     // Check if AI detection is needed
     EventBits_t current_bits = xEventGroupGetBits(camera_event_group);
     bool is_detect_mode = current_bits & (CAMERA_EVENT_PED_DETECT | CAMERA_EVENT_HUMAN_DETECT);
+    bool photo_captured = false;
     
     if (is_detect_mode) {
         // Process input frame
@@ -509,8 +592,16 @@ static void camera_video_frame_operation(uint8_t *camera_buf, uint8_t camera_buf
         }
     }
 
+    if (!(current_bits & CAMERA_EVENT_DELETE)) {
+        photo_captured = PhotoStorage::captureFrame(
+            camera_buf, camera_buf_len, camera_buf_hes, camera_buf_ves);
+    }
+
     // Update display if not in delete state
     if (!(current_bits & CAMERA_EVENT_DELETE) && bsp_display_lock(100)) {
+        if (photo_captured && camera_app != NULL) {
+            camera_app->updateAlbumFromFrame(camera_buf, camera_buf_len);
+        }
         if (ui_ImageCameraShotImage) {
             lv_canvas_set_buffer(ui_ImageCameraShotImage, camera_buf, 
                                camera_buf_hes, camera_buf_ves, 

@@ -24,6 +24,7 @@ public:
     bool close(void);
 
     bool init(void) override;
+    void updateAlbumFromFrame(const uint8_t *frame, size_t frame_size);
 
     int get_camera_ctlr_handle(void);
 
@@ -32,6 +33,7 @@ private:
     static void onScreenCameraShotBtnClick(lv_event_t *e);
     static void onScreenCameraShotAlbumClick(lv_event_t *e);
     static void camera_dectect_task(Camera *app);
+    static void photoStatusTimerCb(lv_timer_t *timer);
 
     enum {
         SCREEN_CAMERA_SHOT,
@@ -40,9 +42,10 @@ private:
     } _screen_index;
     uint16_t _hor_res;
     uint16_t _ver_res;
-    uint16_t _img_album_dsc_size;
-    uint32_t _img_album_buf_bytes;
+    size_t _img_album_buf_bytes;
     uint8_t *_img_album_buffer;
+    lv_obj_t *_photo_status_label;
+    lv_timer_t *_photo_status_timer;
     SemaphoreHandle_t _camera_init_sem;
     int _camera_ctlr_handle;
     lv_img_dsc_t _img_refresh_dsc;
@@ -53,4 +56,3 @@ private:
     uint8_t *_cam_buffer[EXAMPLE_CAM_BUF_NUM];
     size_t _cam_buffer_size[EXAMPLE_CAM_BUF_NUM];
 };
-

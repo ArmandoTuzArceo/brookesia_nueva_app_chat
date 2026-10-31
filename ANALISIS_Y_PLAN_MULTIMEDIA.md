@@ -1,6 +1,6 @@
 # Análisis del proyecto y plan de cámara + galería
 
-Fecha del análisis: 25 de octubre de 2026. La copia analizada contiene 1 044 archivos; 735 son fuentes, cabeceras o archivos de configuración. No hay carpeta `.git` ni `sdkconfig` generado en esta copia, por lo que no es posible distinguir cambios locales de los de origen ni confirmar la configuración efectiva de la última compilación.
+Análisis inicial: 25 de octubre de 2026. La fase 1 de guardado de fotos se implementó y compiló el 30 de octubre de 2026 con ESP-IDF 5.5.5. El repositorio Git está presente. Al iniciar esa fase no había un `sdkconfig` generado; el build creó uno ignorado por Git a partir de `sdkconfig.defaults`. Antes de flashear hay que confirmar que ese archivo coincide con la configuración que funciona en la placa.
 
 ## 1. Mapa real del proyecto
 
@@ -27,7 +27,7 @@ La configuración guardada declara lo siguiente:
 - Objetivo `esp32p4`, PSRAM activa y pantalla RGB565.
 - Cámara `OV02C10`, RAW10, 1288 x 728 a 30 fps (`CONFIG_CAMERA_OV02C10_MIPI_RAW10_1288X728_30FPS=y`). El comentario de `Adaptacion.txt` menciona SC2336 y dos lanes, pero el código que se compila y el Kconfig seleccionan OV02C10 en **un** lane. La fuente de verdad debe ser el `sdkconfig` generado en el equipo que funciona.
 - `CONFIG_EXAMPLE_ENABLE_SD_CARD=y`; el BSP expone la tarjeta como `/sdcard` por SDMMC de cuatro bits.
-- La cabecera del archivo dice ESP-IDF 5.5.5, mientras que el entorno indicado es 5.5.6. La versión 5.5.6 es una actualización de correcciones de 5.5; conviene regenerar y guardar el `sdkconfig` con 5.5.6 antes de tocar la cámara.
+- La versión utilizada para compilar la fase 1 fue ESP-IDF 5.5.5, como se solicita. No se cambió la versión del framework.
 
 El proyecto reserva una tabla de particiones de 16 MiB aunque el log de ejemplo del README llega a detectar un chip flash de 32 MiB. Eso no afecta a la SD, pero no debe cambiarse a ciegas: comprobar primero el tamaño real reportado al arrancar y decidir después si se rediseña la tabla de particiones.
 
@@ -68,20 +68,19 @@ OV02C10 RAW10 -> ISP/esp_video -> V4L2 RGB565 -> dos búferes en PSRAM
      -> opcionalmente detector IA y rectángulos
 
 Botón de disparo
-  -> pausa el evento de tarea
-  -> memcpy del RGB565 actual a _img_album_buffer
-  -> reanuda el preview y muestra esa copia en “Photo”
+  -> solicita el siguiente fotograma
+  -> el callback V4L2 copia RGB565 a un buffer JPEG independiente
+  -> una tarea codifica JPEG y escribe en /sdcard/DCIM/Camera
+  -> al terminar, la UI informa el resultado y actualiza la foto del álbum
 ```
 
-No hay llamada a `jpeg_new_encoder_engine`, `jpeg_encoder_process`, `fopen(..., "wb")`, `fwrite` ni `mkdir` en Camera. El botón **no produce un archivo**: sólo mantiene una copia RGB565 volátil para la miniatura y la pantalla Photo. El componente `apps` ya declara `esp_driver_jpeg`, por lo que no hace falta añadir otra dependencia para codificar JPEG.
+La fase 1 ya conecta el botón con el codificador JPEG por hardware y la escritura FAT. Se guarda un archivo por toque en `/sdcard/DCIM/Camera/ESP_000001.jpg`, usando nombres secuenciales, una calidad JPEG inicial de 80 y un archivo temporal que se renombra al terminar. El botón se deshabilita mientras la operación está activa. Si se cierra Camera después de solicitar la captura, el stream se detiene después de que el callback haya podido copiar y encolar el fotograma; la tarea de escritura no depende de la pantalla ni del buffer V4L2.
 
-Problemas que se deben corregir antes de ampliar Camera:
+Aspectos relacionados con la cámara que siguen fuera de la fase 1:
 
-1. `_img_album_dsc` anuncia un tamaño de datos cuadrado (`min(ancho,alto)^2 * 2`) pero el búfer se reserva con el tamaño real 1288 x 728 x 2. El descriptor de la miniatura no corresponde con la imagen.
-2. La UI generada fija el canvas de preview a 1280 x 720, distinto al fotograma configurado (1288 x 728). Se debe usar la resolución efectiva que devuelve V4L2 o un contenedor que escale el preview.
-3. La copia del botón comparte memoria con la tarea de V4L2. Pausar un bit de evento no garantiza por sí solo que la devolución del búfer al controlador no esté ocurriendo a la vez. Es necesario un mutex o una sección de “snapshot” bien definida.
-4. Comprimir y escribir a SD dentro del callback de LVGL o del callback de V4L2 congelaría el preview. La codificación y la escritura deben vivir en una tarea de trabajo, alimentada por una cola de longitud uno.
-5. `Camera::run()` vuelve a crear la secuencia de inicialización al cerrarse su semáforo; al reorganizarla hay que separar “ya inicialicé el sensor” de “estoy visible”. También se debe liberar tareas, eventos, cliente PPA y búferes en `close()`.
+1. La UI generada fija el canvas de preview a 1280 x 720, distinto del fotograma configurado (1288 x 728).
+2. `Camera::run()` vuelve a solicitar la configuración de los buffers al reabrirse la app; el ciclo completo de cerrar y volver a abrir debe validarse en la placa.
+3. La detección IA y la liberación de tareas, eventos, cliente PPA y buffers requieren una revisión independiente.
 
 ## 5. Almacenamiento de fotos: diseño recomendado
 
@@ -93,31 +92,21 @@ Usar una carpeta propia, nunca la raíz de la tarjeta:
 /sdcard/DCIM/.thumbs/ESP_000001.jpg       (fase posterior)
 ```
 
-Para los nombres, un contador persistido en NVS evita colisiones antes de que SNTP tenga hora. Cuando la hora sea válida se puede migrar a `YYYYMMDD_HHMMSS_###.jpg`, manteniendo el contador como desempate. La escritura debe hacerse en `archivo.tmp`, comprobar `fwrite`, vaciar/cerrar y renombrar a `.jpg`; así una desconexión o reinicio no deja una foto truncada que la galería intente decodificar.
+La implementación actual busca el mayor índice `ESP_*.jpg` existente y usa el siguiente, por lo que no necesita SNTP ni contador NVS. Escribe a un `.tmp`, comprueba `fwrite`/`fflush`/`fclose` y renombra al `.jpg` definitivo; la galería debe ignorar temporales incompletos.
 
-La imagen de cámara es RGB565, de 1 875 328 bytes por foto (1288 x 728 x 2). Una operación segura es:
+La imagen de cámara es RGB565, de 1 875 328 bytes por foto (1288 x 728 x 2). La fase 1 implementa esta operación:
 
-1. Copiar el fotograma a un búfer de snapshot alineado y dedicado.
+1. Copiar el fotograma V4L2 a memoria alineada con `jpeg_alloc_encoder_mem`.
 2. En una tarea de guardado, crear el codificador JPEG del P4.
-3. Codificar RGB565 a JPEG YUV422, calidad inicial 80.
-4. Escribir únicamente los bytes indicados por `out_size`.
-5. Actualizar la miniatura y notificar éxito/error en la UI desde el contexto protegido de LVGL.
+3. Codificar RGB565 a JPEG YUV422, calidad 80.
+4. Reservar un buffer de salida de hasta dos veces el tamaño RGB565 y escribir únicamente los bytes indicados por `out_size`.
+5. Actualizar la miniatura y notificar éxito/error desde el ciclo de LVGL.
 
-Los búferes de entrada y salida deben reservarse con `jpeg_alloc_encoder_mem`, no con `malloc` normal: el driver exige alineación para JPEG/2D-DMA. Para una primera versión, reservar la salida con una capacidad conservadora de al menos el tamaño RAW (más un pequeño margen) y comprobar siempre el resultado. No se debe asumir que `raw_size / 10` cabe para todos los contenidos. La documentación oficial confirma RGB565 como entrada válida, la necesidad de esos búferes alineados y que la codificación se hace en el hardware JPEG del P4.
+Los búferes de entrada y salida se reservan con `jpeg_alloc_encoder_mem`, no con `malloc` normal: el driver exige alineación para JPEG/2D-DMA. Si la reserva o la codificación falla, se informa el error sin escribir un JPEG final incompleto.
 
-La estructura de servicio propuesta es:
+El servicio reside en `components/apps/camera/PhotoStorage.hpp/.cpp`; expone el estado de la captura, acepta un solo trabajo a la vez y conserva la tarea de escritura aunque Camera se cierre.
 
-```cpp
-class PhotoStorage {
-public:
-    esp_err_t begin();                         // valida /sdcard y crea DCIM/Camera
-    esp_err_t enqueueRgb565(const uint8_t *frame, uint16_t w, uint16_t h);
-    bool isBusy() const;
-    const char *lastPath() const;
-};
-```
-
-`Camera::onScreenCameraShotBtnClick()` sólo haría una copia rápida al snapshot y llamaría a `enqueueRgb565`. Una tarea `photo_writer_task` hace la codificación y almacenamiento. Si `isBusy()` es verdadero, el botón muestra “Guardando…” y no acepta otra captura: es mejor rechazar una foto que agotar PSRAM o bloquear la cámara.
+La prueba con tarjeta, lectura del JPEG en un PC, secuencia de capturas, falta de espacio y salida durante la codificación siguen pendientes en el dispositivo físico.
 
 ## 6. App Image existente y la nueva Gallery
 
@@ -139,32 +128,25 @@ Las miniaturas son una segunda fase. La solución eficiente es producir en la ca
 
 ## 7. Orden de implementación y pruebas
 
-1. Guardar el `sdkconfig` que ya funciona y crear un repositorio Git antes del primer cambio. Confirmar por log que la resolución V4L2 es 1288 x 728 y que la tarjeta se monta en `/sdcard`.
-2. Crear `PhotoStorage` con `begin()`, creación de directorios, contador NVS, escritura temporal y una prueba de archivo pequeño.
-3. Añadir JPEG hardware y una tarea de guardado; conectar el botón de Camera; conservar la vista Photo actual como confirmación visual.
-4. Validar en PC que cada `.jpg` abre, que los nombres no se repiten tras reiniciar y que diez capturas seguidas no reducen memoria libre de forma progresiva.
-5. Crear Gallery como app separada, registrar su icono, incluirla en `apps.h` e instalarla en `main.cpp`.
-6. Implementar primero escaneo, orden y visor de una foto; después borrado y actualización; por último miniaturas, favoritos, álbumes, selección múltiple o compartir por Wi-Fi.
+1. **Completado en código:** guardador JPEG, creación de `DCIM/Camera`, nombres secuenciales, archivo temporal y notificación a Camera.
+2. **Completado:** build con ESP-IDF 5.5.5 y configuración efectiva generada desde `sdkconfig.defaults`; no se flasheó el dispositivo.
+3. **Pendiente en placa:** confirmar montaje/resolución por monitor, guardar y abrir una foto, capturas repetidas, SD llena y volver a inicio durante el guardado.
+4. Crear Gallery como app separada, registrar su icono, incluirla en `apps.h` e instalarla en `main.cpp`.
+5. Implementar escaneo, orden y visor de una foto; después borrado y actualización; por último miniaturas, favoritos, álbumes, selección múltiple o compartir por Wi-Fi.
 
 Pruebas mínimas para cada versión: tarjeta ausente, tarjeta FAT32 vacía, carpeta inexistente, una foto válida, diez fotos, JPEG corrupto, SD llena, volver a inicio durante una codificación y reinicio durante la escritura. El resultado correcto es un mensaje recuperable, no un bloqueo de LVGL ni un reinicio.
 
-## 8. Archivos que se modificarán en la primera entrega
+## 8. Archivos modificados en la fase 1
 
 ```text
-components/apps/camera/Camera.hpp             # estado y cola de captura
-components/apps/camera/Camera.cpp             # snapshot y notificación al servicio
-components/apps/media/PhotoStorage.hpp        # API de almacenamiento nueva
-components/apps/media/PhotoStorage.cpp        # JPEG + FAT/NVS + tarea de escritura
-components/apps/gallery/Gallery.hpp           # nueva app
-components/apps/gallery/Gallery.cpp           # escaneo, visor y acciones
-components/apps/gallery/assets/*              # icono LVGL de Gallery
-components/apps/apps.h                        # include de Gallery
-main/main.cpp                                 # phone->installApp(gallery)
+components/apps/camera/Camera.hpp             # estado UI y recursos de foto
+components/apps/camera/Camera.cpp             # solicitud/snapshot, estado y ciclo de cierre
+components/apps/camera/PhotoStorage.hpp       # estado/API de guardado
+components/apps/camera/PhotoStorage.cpp       # JPEG + FAT + tarea de escritura
 ```
 
-`components/apps/CMakeLists.txt` no necesita una lista manual de esos archivos porque usa `file(GLOB_RECURSE ...)`. Aun así, todo símbolo no estático en C debe llevar prefijo o namespace para evitar colisiones entre apps.
+`components/apps/CMakeLists.txt` ya recopila estos archivos mediante `file(GLOB_RECURSE ...)`. Gallery no forma parte de esta fase.
 
 ## Referencias técnicas consultadas
 
 - ESP-IDF 5.5, JPEG para ESP32-P4: https://docs.espressif.com/projects/esp-idf/en/v5.5/esp32p4/api-reference/peripherals/jpeg.html
-- Publicación de ESP-IDF 5.5.6: https://github.com/espressif/esp-idf/releases/tag/v5.5.6
