@@ -5,7 +5,7 @@
 This example, based on [ESP_Brookesia](https://github.com/espressif/esp-brookesia), demonstrates an Android-like interface that includes many different applications. The example utilizes the development board's MIPI-DSI, MIPI-CSI, ESP32-C6, SD card, and audio interfaces. Based on this example, a use case can be created using ESP_Brookesia, enabling efficient development of multimedia applications.
 
 ## Getting Started
-
+#prueba
 #ggg
 ### Prerequisites
 
